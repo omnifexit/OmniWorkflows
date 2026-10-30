@@ -1,0 +1,49 @@
+name: Promote to production
+
+# Called at the end of each repo's CI once every check has passed. Moves the
+# repo's `production` branch to the tested commit; Coolify watches `production`
+# and deploys it. Only fast-forwards, so an older run finishing late can never
+# roll production back.
+#
+# Usage (caller job needs `permissions: contents: write`):
+#
+#   promote:
+#     needs: [<all test jobs>]
+#     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+#     permissions:
+#       contents: write
+#     uses: omnifexit/OmniWorkflows/.github/workflows/promote-to-production.yml@main
+
+on:
+  workflow_call:
+
+concurrency:
+  group: promote-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Fast-forward production
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if gh api -X PATCH "repos/$REPO/git/refs/heads/production" -f sha="$SHA" -F force=false --silent; then
+            echo "production -> $SHA"
+            exit 0
+          fi
+
+          # Not a fast-forward: fine if production already contains this commit
+          # (a newer run got there first), otherwise something is wrong.
+          status=$(gh api "repos/$REPO/compare/$SHA...production" --jq .status)
+          if [ "$status" = "ahead" ] || [ "$status" = "identical" ]; then
+            echo "production already includes $SHA, nothing to do"
+          else
+            echo "::error::production has diverged from main ($status); fix it manually"
+            exit 1
+          fi
