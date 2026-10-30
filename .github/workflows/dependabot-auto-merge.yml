@@ -1,0 +1,91 @@
+name: Dependabot auto-merge
+
+# Called at the end of each repo's CI on Dependabot pull requests, once every
+# check has passed on the pull request.
+#
+# - Minor and patch updates are squash-merged, then CI is started on main
+#   (merges made with GITHUB_TOKEN don't trigger workflows), which tests the
+#   merged code and promotes it to production.
+# - Everything else (any major update, or an update type Dependabot couldn't
+#   determine) is left open: assigned to the reviewer, so GitHub notifies
+#   them, with a comment listing what changes. Majors can need code changes,
+#   also for development dependencies.
+#
+# Usage (caller job needs these permissions):
+#
+#   dependabot:
+#     needs: [<all test jobs>]
+#     if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+#     permissions:
+#       actions: write
+#       contents: write
+#       pull-requests: write
+#     uses: omnifexit/OmniWorkflows/.github/workflows/dependabot-auto-merge.yml@main
+#     with:
+#       ci-workflow: ci.yml
+
+on:
+  workflow_call:
+    inputs:
+      ci-workflow:
+        description: File name of the caller's CI workflow (started on main after a merge; needs `workflow_dispatch`).
+        required: true
+        type: string
+      reviewer:
+        description: GitHub user assigned to updates that need a human.
+        required: false
+        type: string
+        default: anass1090
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      # Allowlist rather than "not major": an unknown or empty update type must
+      # never be merged automatically. --match-head-commit merges only the
+      # commit the tests ran on.
+      - name: Merge minor and patch updates
+        if: contains(fromJSON('["version-update:semver-minor", "version-update:semver-patch"]'), steps.metadata.outputs.update-type)
+        run: gh pr merge "$PR_NUMBER" --squash --delete-branch --match-head-commit "$HEAD_SHA"
+
+      - name: Run CI on main
+        if: contains(fromJSON('["version-update:semver-minor", "version-update:semver-patch"]'), steps.metadata.outputs.update-type)
+        env:
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
+        run: gh workflow run "$CI_WORKFLOW" --ref main
+
+      - name: Leave the update for the reviewer
+        if: ${{ !contains(fromJSON('["version-update:semver-minor", "version-update:semver-patch"]'), steps.metadata.outputs.update-type) }}
+        env:
+          REVIEWER: ${{ inputs.reviewer }}
+          UPDATED_DEPENDENCIES: ${{ steps.metadata.outputs.updated-dependencies-json }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/$GH_REPO/issues/$PR_NUMBER/assignees" -f "assignees[]=$REVIEWER" --silent
+
+          # One comment per tested commit, so re-runs and rebases don't pile up comments.
+          MARKER="<!-- omni-dependabot-auto-merge:$HEAD_SHA -->"
+          if gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate --jq '.[].body' | grep -qF "$MARKER"; then
+            exit 0
+          fi
+
+          {
+            echo "$MARKER"
+            echo "**Not merged automatically.** The tests passed, but this is a major update (or its type couldn't be determined), which can need code changes the tests don't cover. Check the changelog and merge it yourself:"
+            echo
+            jq -r '.[] | "- `\(.dependencyName)` \(.prevVersion // "?") → \(.newVersion // "?") (\(.updateType // "unknown"))"' <<< "${UPDATED_DEPENDENCIES:-[]}"
+          } > comment.md
+
+          gh pr comment "$PR_NUMBER" --body-file comment.md
