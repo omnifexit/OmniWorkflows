@@ -69,6 +69,5 @@ Optional input: `reviewer` (default `anass1090`).
 
 ## Access
 
-This repo is private; it is shared with the other repos through
-Settings → Actions → General → Access ("Accessible from repositories owned by
-the user").
+This repo is public, so the other repos' workflows and Dependabot can read it
+without any access setting. It holds no secrets: never add any here.
